@@ -88,7 +88,7 @@ app.use(
     resave: false,
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
-    cookie: { secure: isProduction, httpOnly: true }, // Set to true if using HTTPS
+    cookie: { secure: isProduction, httpOnly: true, sameSite: 'none' }, // Set to true if using HTTPS
   })
 );
 
