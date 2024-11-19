@@ -76,6 +76,7 @@ const groupSchema = new mongoose.Schema({
 });
 
 const Group = mongoose.model('Group', groupSchema);
+const isProduction = process.env.NODE_ENV === "production";
 
 // Middleware
 app.use(cors({ origin: process.env.NEXT_PUBLIC_API_URL, credentials: true }));
@@ -85,7 +86,7 @@ app.use(
     secret: process.env.SESSION_SECRET || "your_secret_key", // Ensure SESSION_SECRET is set in .env
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: false }, // Set to true if using HTTPS
+    cookie: { secure: isProduction }, // Set to true if using HTTPS
   })
 );
 
