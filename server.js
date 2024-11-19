@@ -197,6 +197,7 @@ app.post("/api/login", async (req, res) => {
     if (!isPasswordValid) return res.status(400).json({ message: "Incorrect password" });
 
     req.session.userId = user._id; // Store user ID in session
+    req.session.save();
     res.json({
       message: "Login successful!",
       user: {
