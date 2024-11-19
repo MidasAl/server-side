@@ -130,6 +130,7 @@ const upload = multer({
 
 // Middleware to check if user is authenticated
 function isAuthenticated(req, res, next) {
+  console.log(req.session.userId);
   if (req.session.userId) {
     next();
   } else {
@@ -198,6 +199,7 @@ app.post("/api/login", async (req, res) => {
 
     req.session.userId = user._id; // Store user ID in session
     req.session.save();
+    console.log(req.session.userId);
     res.json({
       message: "Login successful!",
       user: {
