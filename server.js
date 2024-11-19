@@ -87,8 +87,8 @@ app.use(
     secret: process.env.SESSION_SECRET || "your_secret_key", // Ensure SESSION_SECRET is set in .env
     resave: false,
     saveUninitialized: false,
-    store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
-    cookie: { secure: isProduction, httpOnly: true, sameSite: 'none' }, // Set to true if using HTTPS
+    store: new MongoStore.create({ uri: process.env.MONGODB_URI, collection: 'sessions'}),
+    cookie: { secure: isProduction, httpOnly: true, sameSite: process.env.NODE_ENV === "production" ? 'none' : 'lax'}, // Set to true if using HTTPS
   })
 );
 
