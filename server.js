@@ -6,7 +6,6 @@ const session = require("express-session");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer"); // For handling file uploads
-const axios = require("axios"); // For making HTTP requests to Python API
 const fs = require("fs");
 const path = require("path");
 const { requestReimbursement } = require('./reimbursement-processor');
@@ -99,7 +98,7 @@ app.use(
     store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
     cookie: { 
       secure: true,
-      httpOnly: true,
+      httpOnly: false,
       sameSite: 'none',
     }
   })
