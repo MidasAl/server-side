@@ -82,21 +82,29 @@ const MongoStore = require('connect-mongo');
 // Middleware
 const URL = process.env.NEXT_PUBLIC_API_URL
 // const URL = `http://localhost:3000`
-app.use(cors({ 
-  origin: URL, 
+app.use(cors({
+  origin: URL,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['set-cookie']
 }));
 app.use(express.json());
 app.set('trust proxy', 1);
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || "your_secret_key", // Ensure SESSION_SECRET is set in .env
+    secret: process.env.SESSION_SECRET || "your_secret_key",
     resave: false,
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
-    cookie: { secure: isProduction, httpOnly: true, sameSite: process.env.NODE_ENV === "production" ? 'none' : 'lax'}, // Set to true if using HTTPS
+    cookie: { 
+      secure: isProduction,
+      httpOnly: true,
+      sameSite: process.env.NODE_ENV === "production" ? 'none' : 'lax',
+      domain: process.env.NODE_ENV === "production" ? undefined : 'localhost',
+      partitioned: false,
+      sameSite: 'none'
+    }
   })
 );
 
@@ -697,15 +705,6 @@ app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
     console.error("Error fetching reimbursements:", error);
     res.status(500).json({ message: "Error fetching reimbursements", error });
   }
-});
-
-// Add these headers
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Allow-Origin', URL);
-  res.header('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin,X-Requested-With,Content-Type,Accept,Authorization');
-  next();
 });
 
 // Start the server
