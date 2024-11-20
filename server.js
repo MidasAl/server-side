@@ -80,7 +80,9 @@ const isProduction = process.env.NODE_ENV === "production";
 const MongoStore = require('connect-mongo');
 
 // Middleware
-app.use(cors({ origin: process.env.NEXT_PUBLIC_API_URL, credentials: true }));
+// const URL = process.env.NEXT_PUBLIC_API_URL
+const URL = `http://localhost:3000`
+app.use(cors({ origin: URL, credentials: true }));
 app.use(express.json());
 app.set('trust proxy', 1);
 app.use(
