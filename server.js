@@ -101,8 +101,6 @@ app.use(
       secure: true,
       httpOnly: true,
       sameSite: 'none',
-      domain: "production",
-      partitioned: false,
     }
   })
 ); 
