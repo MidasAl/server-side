@@ -98,8 +98,9 @@ app.use(
     store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
     cookie: { 
       secure: true,
-      httpOnly: false,
+      httpOnly: true,
       sameSite: 'none',
+      maxAge: 1000 * 60 * 60 * 24,
     }
   })
 ); 
