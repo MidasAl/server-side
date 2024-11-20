@@ -98,15 +98,14 @@ app.use(
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
     cookie: { 
-      secure: isProduction,
+      secure: true,
       httpOnly: true,
-      sameSite: process.env.NODE_ENV === "production" ? 'none' : 'lax',
-      domain: process.env.NODE_ENV === "production" ? undefined : 'localhost',
+      sameSite: 'none',
+      domain: "production",
       partitioned: false,
-      sameSite: 'none'
     }
   })
-);
+); 
 
 // Serve the 'uploads' directory as static
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
