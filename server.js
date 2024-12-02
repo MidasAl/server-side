@@ -2,7 +2,6 @@
 
 const express = require("express");
 const bcrypt = require("bcrypt");
-const session = require("express-session");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer"); // For handling file uploads
@@ -10,6 +9,8 @@ const fs = require("fs");
 const path = require("path");
 const { requestReimbursement } = require('./reimbursement-processor');
 require("dotenv").config();
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key'; // Make sure to set this in .env
 
 const app = express();
 
@@ -75,35 +76,26 @@ const groupSchema = new mongoose.Schema({
 });
 
 const Group = mongoose.model('Group', groupSchema);
-const isProduction = process.env.NODE_ENV === "production";
-const MongoStore = require('connect-mongo');
 
 // Middleware
-const URL = process.env.NEXT_PUBLIC_API_URL
-// const URL = `http://localhost:3000`
+var secure = false
+var URL = `http://localhost:3000`
+var sameSite = 'lax'
+
+if (process.env.isProduction) {
+  URL = process.env.NEXT_PUBLIC_API_URL
+  secure = true
+  sameSite = 'none'
+} 
+
 app.use(cors({
-  origin: URL,
+  origin: `http://localhost:3000`,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['set-cookie']
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 app.set('trust proxy', 1);
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || "your_secret_key",
-    resave: false,
-    saveUninitialized: false,
-    store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
-    cookie: { 
-      secure: true,
-      httpOnly: true,
-      sameSite: 'none',
-      maxAge: 1000 * 60 * 60 * 24,
-    }
-  })
-); 
 
 // Serve the 'uploads' directory as static
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -143,11 +135,18 @@ const upload = multer({
 
 // Middleware to check if user is authenticated
 function isAuthenticated(req, res, next) {
-  console.log(req.session.userId);
-  if (req.session.userId) {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
     next();
-  } else {
-    res.status(401).json({ message: 'Not authenticated' });
+  } catch (error) {
+    console.error('Auth error:', error);
+    return res.status(401).json({ message: "Invalid or expired token" });
   }
 }
 
@@ -202,7 +201,6 @@ app.post("/api/register", async (req, res) => {
 // Login endpoint
 app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
-
   try {
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ message: "User not found" });
@@ -210,11 +208,18 @@ app.post("/api/login", async (req, res) => {
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) return res.status(400).json({ message: "Incorrect password" });
 
-    req.session.userId = user._id; // Store user ID in session
-    req.session.save();
-    console.log(req.session.userId);
+    // Create JWT payload
+    const payload = {
+      userId: user._id,
+      email: user.email,
+      role: user.role,
+    };
+
+    // Generate JWT
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "1d" });
     res.json({
       message: "Login successful!",
+      token, // Send token to the frontend
       user: {
         name: user.name,
         email: user.email,
@@ -226,10 +231,11 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
+
 // Endpoint to get logged-in user profile
 app.get("/api/profile", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId).populate('activeGroup');
+    const user = await User.findById(req.user.userId).populate('activeGroup');
     if (!user) return res.status(404).json({ message: "User not found" });
     
     let adminEmail = null;
@@ -251,18 +257,15 @@ app.get("/api/profile", isAuthenticated, async (req, res) => {
 
 // Logout endpoint
 app.post("/api/logout", (req, res) => {
-  req.session.destroy((err) => {
-    if (err) return res.status(500).json({ message: "Failed to log out" });
-    res.clearCookie("connect.sid"); // Clear session cookie
-    res.json({ message: "Logged out successfully" });
-  });
+  // With JWT, the client just needs to remove the token
+  res.json({ message: "Logged out successfully" });
 });
 
 // Generate invite code endpoint
 app.post("/api/admin/generate-code", isAuthenticated, async (req, res) => {
   try {
     // First, verify the user is an admin
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
 
     if (!user || user.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
@@ -313,7 +316,7 @@ app.post("/api/admin/generate-code", isAuthenticated, async (req, res) => {
 // Get users for admin
 app.get("/api/admin/users", isAuthenticated, async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
@@ -355,7 +358,7 @@ app.post("/api/join_group", isAuthenticated, async (req, res) => {
       return res.status(400).json({ message: "Invalid or expired group code." });
     }
 
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
     if (!user) {
       return res.status(404).json({ message: "User not found." });
     }
@@ -408,7 +411,7 @@ app.post("/api/switch_active_group", isAuthenticated, async (req, res) => {
   }
 
   try {
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
 
     if (!user) {
       return res.status(404).json({ message: "User not found." });
@@ -484,8 +487,8 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
   const receipt = req.file;
 
   try {
-    // Retrieve user from session
-    const user = await User.findById(req.session.userId).populate('activeGroup');
+    // Get user from JWT token instead of session
+    const user = await User.findById(req.user.userId).populate('activeGroup');
     if (!user) {
       if (receipt && fs.existsSync(receipt.path)) {
         fs.unlinkSync(receipt.path);
@@ -599,7 +602,7 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
 // Admin Dashboard to View Reimbursement Requests
 app.get("/api/admin/reimbursements", isAuthenticated, async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
@@ -629,7 +632,7 @@ app.use((err, req, res, next) => {
 // Admin Info Endpoint
 app.get("/api/admin/info", isAuthenticated, async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
@@ -645,7 +648,7 @@ app.get("/api/admin/info", isAuthenticated, async (req, res) => {
 // Get user's groups endpoint
 app.get("/api/groups", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId).populate('groups').populate('activeGroup');
+    const user = await User.findById(req.user.userId).populate('groups').populate('activeGroup');
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -678,7 +681,7 @@ app.get("/api/groups", isAuthenticated, async (req, res) => {
 // Get user's reimbursement requests endpoint
 app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
