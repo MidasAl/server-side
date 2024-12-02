@@ -79,7 +79,7 @@ const Group = mongoose.model('Group', groupSchema);
 
 // Middleware
 var secure = false
-var URL = `http://localhost:3000`
+var URL = `https://front-end-lime-zeta.vercel.app`
 var sameSite = 'lax'
 
 if (process.env.isProduction) {
@@ -89,7 +89,7 @@ if (process.env.isProduction) {
 } 
 
 app.use(cors({
-  origin: `http://localhost:3000`,
+  origin: URL,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
