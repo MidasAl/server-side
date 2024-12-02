@@ -78,18 +78,18 @@ const groupSchema = new mongoose.Schema({
 const Group = mongoose.model('Group', groupSchema);
 
 // Middleware
-var secure = false
-var URL = `https://front-end-lime-zeta.vercel.app`
-var sameSite = 'lax'
+var secure = false;
+var sameSite = 'lax';
+var corsOrigin = 'http://localhost:3000'; // Default development URL
 
-if (process.env.isProduction) {
-  URL = process.env.NEXT_PUBLIC_API_URL
-  secure = true
-  sameSite = 'none'
+if (process.env.NODE_ENV === 'production') {
+  secure = true;
+  sameSite = 'none';
+  corsOrigin = process.env.NEXT_PUBLIC_API_URL || 'https://front-end-lime-zeta.vercel.app';
 } 
 
 app.use(cors({
-  origin: URL,
+  origin: corsOrigin,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
