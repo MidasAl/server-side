@@ -1,15 +1,26 @@
-// server.js
-
 const express = require("express");
 const bcrypt = require("bcrypt");
 const session = require("express-session");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const multer = require("multer"); // For handling file uploads
-const axios = require("axios"); // For making HTTP requests to Python API
+const multer = require("multer");
+const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const { requestReimbursement } = require('./reimbursement-processor');
+const AWS = require("aws-sdk");
+
+const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
+const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
+const AWS_S3_BUCKET_NAME = process.env.AWS_S3_BUCKET_NAME || 'midasbucket';
+const AWS_REGION = process.env.AWS_REGION || 'us-east-2';
+
+const s3_client = new AWS.S3({
+  region: AWS_REGION,
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+});
+
 require("dotenv").config();
 
 const app = express();
@@ -29,8 +40,8 @@ const userSchema = new mongoose.Schema({
   email: { type: String, unique: true },
   password: String,
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
-  groups: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Group' }], // Array of group IDs
-  activeGroup: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', default: null }, // Active group ID
+  groups: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Group' }],
+  activeGroup: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', default: null },
 });
 
 const User = mongoose.model("User", userSchema);
@@ -42,7 +53,7 @@ const inviteCodeSchema = new mongoose.Schema({
   used: { type: Boolean, default: false },
   usedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   createdAt: { type: Date, default: Date.now },
-  expiresAt: { type: Date, default: () => new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) }, // 7 days expiry
+  expiresAt: { type: Date, default: () => new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) },
 });
 
 const InviteCode = mongoose.model('InviteCode', inviteCodeSchema);
@@ -69,7 +80,7 @@ const groupSchema = new mongoose.Schema({
   name: { type: String, required: true },
   company: { type: String, required: true },
   inviteCode: { type: String, required: true, unique: true },
-  adminEmail: { type: String, required: true }, // Admin's email
+  adminEmail: { type: String, required: true },
   isPrivate: { type: Boolean, default: false },
   memberCount: { type: Number, default: 0 },
   lastActive: { type: Date, default: Date.now }
@@ -77,22 +88,31 @@ const groupSchema = new mongoose.Schema({
 
 const Group = mongoose.model('Group', groupSchema);
 
+// New schemas for policy management
+const requestCountSchema = new mongoose.Schema({
+  userEmail: String,
+  adminEmail: String,
+  count: { type: Number, default: 0 },
+  lastReset: { type: Date, default: Date.now }
+});
+
+const RequestCount = mongoose.model('RequestCount', requestCountSchema);
+
 // Middleware
 app.use(cors({ origin: "http://localhost:3000", credentials: true }));
 app.use(express.json());
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || "your_secret_key", // Ensure SESSION_SECRET is set in .env
+    secret: process.env.SESSION_SECRET || "your_secret_key",
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: false }, // Set to true if using HTTPS
+    cookie: { secure: false },
   })
 );
 
-// Serve the 'uploads' directory as static
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Configure Multer for file uploads
+// Configure Multer
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     const uploadPath = path.join(__dirname, 'uploads');
@@ -115,17 +135,18 @@ const upload = multer({
       'application/pdf',
       'image/jpeg',
       'image/png',
-      'application/zip'
+      'application/zip',
+      'text/plain'
     ];
     if (!allowed_types.includes(file.mimetype)) {
-      return cb(new Error('Only .docx, .pdf, .jpg, .png and .zip files are allowed!'), false);
+      return cb(new Error('Only .docx, .pdf, .jpg, .png, .txt and .zip files are allowed!'), false);
     }
     cb(null, true);
   },
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB limit
+  limits: { fileSize: 5 * 1024 * 1024 }
 });
 
-// Middleware to check if user is authenticated
+// Authentication middleware
 function isAuthenticated(req, res, next) {
   if (req.session.userId) {
     next();
@@ -457,6 +478,45 @@ async function forwardReimbursementRequest(data, receiptPath) {
   }
 }
 
+// New endpoint for admin policy upload
+app.post("/api/admin/upload_policy", isAuthenticated, upload.array('files'), async (req, res) => {
+  try {
+    const admin = await User.findById(req.session.userId);
+    if (!admin || admin.role !== 'admin') {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
+    const files = req.files;
+    const adminRepo = admin.email.replace('@', '').replace(/\./g, '');
+    
+    for (const file of files) {
+      const s3Key = `Reimbursement/${adminRepo}/policies/${file.originalname}`;
+      
+      await s3_client.upload({
+        Bucket: AWS_S3_BUCKET_NAME,
+        Key: s3Key,
+        Body: fs.createReadStream(file.path)
+      }).promise();
+
+      // Mark as active
+      await s3_client.upload({
+        Bucket: AWS_S3_BUCKET_NAME,
+        Key: `Reimbursement/${adminRepo}/policies/ACTIVE`,
+        Body: 'ACTIVE'
+      }).promise();
+
+      if (fs.existsSync(file.path)) {
+        fs.unlinkSync(file.path);
+      }
+    }
+
+    res.json({ message: 'Policy uploaded successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Error uploading policy', error: error.message });
+  }
+});
+
+// Modified request_reimbursement endpoint
 app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated, async (req, res) => {
   console.log("Received request body:", req.body);
   console.log("Received file:", req.file);
@@ -465,7 +525,6 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
   const receipt = req.file;
 
   try {
-    // Retrieve user from session
     const user = await User.findById(req.session.userId).populate('activeGroup');
     if (!user) {
       if (receipt && fs.existsSync(receipt.path)) {
@@ -477,7 +536,6 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       });
     }
 
-    // Validate role
     if (user.role !== 'user') {
       if (receipt && fs.existsSync(receipt.path)) {
         fs.unlinkSync(receipt.path);
@@ -488,7 +546,6 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       });
     }
 
-    // Validate receipt file
     if (!receipt) {
       return res.status(400).json({ 
         status: "Error",
@@ -496,7 +553,6 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       });
     }
 
-    // Get admin email from user's active group
     const admin_email = user.activeGroup ? user.activeGroup.adminEmail : null;
     if (!admin_email) {
       return res.status(400).json({ 
@@ -505,7 +561,32 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       });
     }
 
-    // Forward to our JavaScript processor
+    // Check request count
+    let requestCount = await RequestCount.findOne({
+      userEmail: user.email,
+      adminEmail: admin_email
+    });
+
+    if (!requestCount) {
+      requestCount = new RequestCount({
+        userEmail: user.email,
+        adminEmail: admin_email
+      });
+    }
+
+    const now = new Date();
+    const daysSinceReset = (now - requestCount.lastReset) / (1000 * 60 * 60 * 24);
+    
+    if (daysSinceReset >= 1) {
+      requestCount.count = 0;
+      requestCount.lastReset = now;
+    } else if (requestCount.count >= 10) {
+      return res.status(400).json({
+        status: "Rejected",
+        feedback: "Daily request limit reached. Please try again tomorrow."
+      });
+    }
+
     console.log("Forwarding to reimbursement processor");
     const processedResponse = await forwardReimbursementRequest(
       {
@@ -518,7 +599,11 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       receipt.path
     );
 
-    // Save the reimbursement request in the database
+    if (processedResponse.status === 'Approved') {
+      requestCount.count += 1;
+      await requestCount.save();
+    }
+
     let parsedDetails = {};
     try {
       parsedDetails = typeof reimbursement_details === 'string' 
@@ -532,7 +617,7 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       userEmail: user.email,
       adminEmail: admin_email,
       reimbursementDetails: reimbursement_details,
-      amount: parsedDetails.amount || "0",
+      amount: parsedDetails.amount || 0,
       category: parsedDetails.type || "unknown",
       receiptPath: receipt.path,
       s3Urls: processedResponse.uploaded_files || [],
@@ -545,10 +630,8 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
     await reimbursementRequest.save();
     console.log("Reimbursement request saved to database");
 
-    // Set response headers
     res.setHeader('Content-Type', 'application/json');
 
-    // Prepare and send response
     const response = {
       status: processedResponse.status,
       feedback: processedResponse.feedback,
@@ -567,15 +650,14 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       feedback: error.message || "An error occurred while processing your request."
     });
   } finally {
-    // Only cleanup temporary files if needed
     if (receipt && fs.existsSync(receipt.path)) {
-      // You might want to check if it's a temp file before deleting
       if (receipt.path.includes('temp') || receipt.path.includes('tmp')) {
         fs.unlinkSync(receipt.path);
       }
     }
   }
 });
+
 
 // Admin Dashboard to View Reimbursement Requests
 app.get("/api/admin/reimbursements", isAuthenticated, async (req, res) => {
