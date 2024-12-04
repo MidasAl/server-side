@@ -767,6 +767,45 @@ app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
   }
 });
 
+// Add after other endpoints
+app.post("/api/admin/manual_policy", isAuthenticated, async (req, res) => {
+  try {
+    const admin = await User.findById(req.session.userId);
+    if (!admin || admin.role !== 'admin') {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
+    const { category, amount, times, period } = req.body;
+    if (!category || !amount || !times || !period) {
+      return res.status(400).json({ message: 'All fields required' });
+    }
+
+    if (!['day', 'week', 'month', 'year'].includes(period)) {
+      return res.status(400).json({ message: 'Invalid period' });
+    }
+
+    const policyText = `Allow this user to spend in ${category} up to the amount of ${amount}. The user is allowed to make requests ${times} times per ${period}.`;
+    const adminRepo = admin.email.replace('@', '').replace(/\./g, '');
+    const s3Key = `Reimbursement/${adminRepo}/policies/manual_${category}.txt`;
+
+    await s3_client.upload({
+      Bucket: AWS_S3_BUCKET_NAME,
+      Key: s3Key,
+      Body: policyText
+    }).promise();
+
+    await s3_client.upload({
+      Bucket: AWS_S3_BUCKET_NAME,
+      Key: `Reimbursement/${adminRepo}/policies/ACTIVE`,
+      Body: 'ACTIVE'
+    }).promise();
+
+    res.json({ message: 'Policy created successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Error creating policy', error: error.message });
+  }
+});
+
 // Start the server
 const PORT = process.env.PORT || 4999;
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
