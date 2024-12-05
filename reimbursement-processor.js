@@ -443,4 +443,61 @@ async function requestReimbursement(data) {
     }
 }
 
-module.exports = { requestReimbursement };
+async function categorizeAndExtractAmountFromPdf(pdfText) {
+    const maxRetries = 3;
+    const baseDelay = 1000;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const messages = [
+                {
+                    role: "system",
+                    content: (
+                        "You are a financial assistant specialized in analyzing and processing expense documents. " +
+                        "Your task is to identify and extract categories and the corresponding amounts from the provided document. " +
+                        "Please ensure that:\n" +
+                        "- Categories are clearly labeled as 'Category: <Category Name>'.\n" +
+                        "- Amounts are clearly labeled as 'Amount: <Numeric Value>' and include any relevant currency symbols.\n" +
+                        "- Only include one category and amount. 'Category: <Category Name>, Amount: <Numeric Value>'.\n"
+                    )
+                },
+                {
+                    role: "user",
+                    content: `Here is the document content:\n\n${pdfText}`
+                }
+            ];
+            
+            const response = await client.createChatCompletion({
+                model: "gpt-4o-mini",
+                messages: messages
+            });
+            
+            const analysis = response.data.choices[0].message.content;
+            const lines = analysis.trim().split('\n');
+            let results = [];
+
+            for (const line of lines) {
+                const categoryMatch = line.match(/Category:\s*(.+?)(?=,|$)/i);
+                const amountMatch = line.match(/Amount:\s*([\d.,]+(?:\s*\w+)?)/i);
+
+                results.push({
+                    category: categoryMatch ? categoryMatch[1].trim() : 'Unknown',
+                    amount: amountMatch ? amountMatch[1].trim() : '50'
+                });
+            }
+            console.log(results);
+            return results;
+        } catch (e) {
+            if (e.response?.status === 429 && attempt < maxRetries - 1) {
+                const delay = baseDelay * Math.pow(2, attempt);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+            throw e;
+        }
+    }
+    throw new Error('Max retries exceeded for OpenAI API');
+}
+
+
+module.exports = {categorizeAndExtractAmountFromPdf, requestReimbursement, MultiFileProcessor };

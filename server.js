@@ -7,7 +7,7 @@ const cors = require("cors");
 const multer = require("multer"); // For handling file uploads
 const fs = require("fs");
 const path = require("path");
-const { requestReimbursement } = require('./reimbursement-processor');
+const { requestReimbursement, MultiFileProcessor, categorizeAndExtractAmountFromPdf } = require('./reimbursement-processor');
 const AWS = require("aws-sdk");
 
 require("dotenv").config();
@@ -845,6 +845,44 @@ app.get("/api/admin/policies", isAuthenticated, async (req, res) => {
   } catch (error) {
     console.error('Error fetching policies:', error);
     res.status(500).json({ message: 'Error fetching policies', error: error.message });
+  }
+});
+
+// Endpoint to extract text from a PDF
+app.post("/api/extract_pdf_text", upload.single('policyFile'), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    // Ensure the file is a PDF
+    if (path.extname(file.originalname).toLowerCase() !== '.pdf') {
+      return res.status(400).json({ message: 'Only PDF files are allowed' });
+    }
+
+    // Call the extractTextFromPdf function
+    const text = await MultiFileProcessor.extractTextFromPdf(file.path);
+    // Categorize the expense and extract amount
+    const extractedData = await categorizeAndExtractAmountFromPdf(text);
+
+    let category = 'Could not detect';
+    let amount = 'Could not detect';
+
+    if (extractedData.length > 0) {
+      category = extractedData[0].category;
+      amount = extractedData[0].amount;
+    }
+    const info = `Category: ${category}\nAmount: ${amount}\nDate: ${"everyday"}`;
+    res.json({ info });
+  } catch (error) {
+    console.error('Error extracting text from PDF:', error);
+    res.status(500).json({ message: 'Error extracting text from PDF', error: error.message });
+  } finally {
+    // Cleanup: Remove the uploaded file
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
   }
 });
 
