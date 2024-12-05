@@ -7,7 +7,15 @@ const multer = require("multer");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const { requestReimbursement } = require('./reimbursement-processor');
+const { 
+  MultiFileProcessor, 
+  analyzeWithGpt4o,
+  uploadToS3,
+  sanitizeFilename,
+  extractPolicyDetails,
+  logger,
+  saveUploadFile,
+} = require('./reimbursement-processor');
 const AWS = require("aws-sdk");
 
 const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
@@ -42,9 +50,33 @@ const userSchema = new mongoose.Schema({
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
   groups: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Group' }],
   activeGroup: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', default: null },
+  // Modifed policies to be per group
+  policies: [{
+    groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
+    policy: {
+      category: { type: String, default: 'Expenses' },
+      amount: { type: Number, default: 500 },
+      frequency: {
+        times: { type: Number, default: 10 },
+        days: { type: Number, default: 7 }
+      }
+    }
+  }],
+  members: [{ 
+    username: String,
+    email: String
+  }]
+});
+
+const requestTrackingSchema = new mongoose.Schema({
+  userEmail: { type: String, required: true },
+  groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
+  count: { type: Number, default: 0 },
+  lastReset: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model("User", userSchema);
+const RequestTracking = mongoose.model('RequestTracking', requestTrackingSchema);
 
 // InviteCode schema and model
 const inviteCodeSchema = new mongoose.Schema({
@@ -63,8 +95,8 @@ const reimbursementRequestSchema = new mongoose.Schema({
   userEmail: { type: String, required: true },
   adminEmail: { type: String, required: true },
   reimbursementDetails: { type: String, required: true },
-  amount: { type: Number, required: true },
-  category: { type: String, required: true },
+  amount: { type: Number, required: false },
+  category: { type: String, required: false },
   receiptPath: { type: String, required: true },
   s3Urls: [{ type: String }],
   status: { type: String, enum: ['Approved', 'Rejected', 'Pending'], required: true },
@@ -83,20 +115,10 @@ const groupSchema = new mongoose.Schema({
   adminEmail: { type: String, required: true },
   isPrivate: { type: Boolean, default: false },
   memberCount: { type: Number, default: 0 },
-  lastActive: { type: Date, default: Date.now }
+  lastActive: { type: Date, default: Date.now },
 });
 
 const Group = mongoose.model('Group', groupSchema);
-
-// New schemas for policy management
-const requestCountSchema = new mongoose.Schema({
-  userEmail: String,
-  adminEmail: String,
-  count: { type: Number, default: 0 },
-  lastReset: { type: Date, default: Date.now }
-});
-
-const RequestCount = mongoose.model('RequestCount', requestCountSchema);
 
 // Middleware
 app.use(cors({ origin: "http://localhost:3000", credentials: true }));
@@ -195,6 +217,7 @@ app.post("/api/register", async (req, res) => {
       role: role,
       groups: [],
       activeGroup: null,
+      policies: []  // Start with empty policies array
     });
     await user.save();
     res.status(201).json({ message: "User registered successfully" });
@@ -298,6 +321,15 @@ app.post("/api/admin/generate-code", isAuthenticated, async (req, res) => {
     });
     await group.save();
 
+    if (!user.groups.includes(group._id)) {
+      user.groups.push(group._id);
+    }
+    
+    if (!user.activeGroup) {
+      user.activeGroup = group._id;
+    }
+    await user.save();
+
     res.json({ 
       code,
       message: 'Invite code generated successfully'
@@ -344,7 +376,6 @@ app.get("/api/admin/users", isAuthenticated, async (req, res) => {
 
 // Join group endpoint
 app.post("/api/join_group", isAuthenticated, async (req, res) => {
-
   const { group_code } = req.body;
 
   if (!group_code) {
@@ -362,35 +393,36 @@ app.post("/api/join_group", isAuthenticated, async (req, res) => {
       return res.status(404).json({ message: "User not found." });
     }
 
-    // Find the group associated with the invite code
     const group = await Group.findOne({ inviteCode: group_code });
     if (!group) {
       return res.status(404).json({ message: "Group not found." });
     }
 
-    // Check if user is already in the group
     if (user.groups.includes(group._id)) {
       return res.status(400).json({ message: "User is already a member of this group." });
     }
 
     // Add the group to user's groups array
-    console.log(user.email);
     user.groups.push(group._id);
-
-    // Set this group as active only if the user doesn't have an active group
     if (!user.activeGroup) {
       user.activeGroup = group._id;
     }
-
-
     await user.save();
 
-    // Update group member count
+    // Update admin's members array
+    const admin = await User.findOne({ email: group.adminEmail });
+    if (admin) {
+      admin.members.push({
+        username: user.name,
+        email: user.email
+      });
+      await admin.save();
+    }
+
     group.memberCount += 1;
     group.lastActive = new Date();
     await group.save();
 
-    // Mark the invite code as used
     code.used = true;
     code.usedBy = user._id;
     await code.save();
@@ -429,44 +461,114 @@ app.post("/api/switch_active_group", isAuthenticated, async (req, res) => {
   }
 });
 
+async function requestReimbursement(data) {
+  try {
+    const { role, name, email, admin_email, reimbursement_details, files, policies } = data;
+
+    if (!role || role.toLowerCase() !== 'user') {
+      throw new Error("Role must be 'user'.");
+    }
+    
+    const processor = new MultiFileProcessor();
+    const temp_files = [];
+    const all_content = [];
+    const s3_urls = [];
+    let is_image = false;
+
+    try {
+      for (const file of files) {
+        const ext = processor.constructor.getFileExtension(file.originalname);
+        if (!processor.constructor.ALLOWED_EXTENSIONS.has(ext)) {
+          throw new Error(`Unsupported file type: ${ext}`);
+        }
+        
+        const temp_file_path = await saveUploadFile(file);
+
+        const original_filename = sanitizeFilename(file.originalname);
+        temp_files.push({ path: temp_file_path, original_filename });
+        
+        if (ext === '.zip') {
+          const zip_contents = await processor.constructor.processZip(temp_file_path);
+          all_content.push(...zip_contents);
+        } else {
+          const processed_content = await processor.constructor.processSingleFile(temp_file_path);
+          all_content.push(processed_content);
+        }
+      }
+
+      let combined_content = '';
+      for (const content_item of all_content) {
+        if (content_item.is_image) {
+          is_image = true;
+        }
+        combined_content += content_item.content + '\n';
+      }
+
+      const policy = policies || {
+        category: 'Expenses',
+        amount: 500,
+        frequency: { times: 10, days: 7 }
+      };
+
+      const analysis_result = await analyzeWithGpt4o(
+        reimbursement_details,
+        combined_content,
+        is_image,
+        policy
+      );
+
+      const final_decision = analysis_result.decision;
+      const feedback = analysis_result.feedback;
+
+      for (const { path: temp_file, original_filename } of temp_files) {
+        const s3_url = await uploadToS3(temp_file, original_filename, final_decision, admin_email, email);
+        s3_urls.push(s3_url);
+      }
+
+      return {
+        status: final_decision,
+        amount: analysis_result.amount || 0,
+        category: analysis_result.category || '',
+        feedback: feedback.trim(),
+        processed_files: all_content.length,
+        uploaded_files: s3_urls
+      };
+          
+    } finally {
+      for (const { path } of temp_files) {
+        if (fs.existsSync(path)) {
+          fs.unlinkSync(path);
+        }
+      }
+    }
+  } catch (e) {
+    logger.error(`Error in requestReimbursement: ${e.message}`);
+    throw new Error(`Error processing request: ${e.message}`);
+  }
+}
+
 async function forwardReimbursementRequest(data, receiptPath) {
   try {
     console.log('Starting forwardReimbursementRequest with path:', receiptPath);
     console.log('Input data:', data);
 
-    // Create a file object similar to what multer would create
     const fileObj = {
-      originalname: receiptPath.split('/').pop(), // Gets filename from path
-      buffer: await fs.promises.readFile(receiptPath) // Read file into buffer
+      originalname: receiptPath.split('/').pop(),
+      buffer: await fs.promises.readFile(receiptPath)
     };
-    console.log('Created file object with name:', fileObj.originalname);
 
-    // Prepare data object in the format our JS function expects
     const requestData = {
       role: data.role,
       name: data.name,
       email: data.email,
       admin_email: data.admin_email,
       reimbursement_details: data.reimbursement_details,
-      files: [fileObj]
+      files: [fileObj],
+      policies: data.policies
     };
-    console.log('Prepared request data:', {
-      ...requestData,
-      files: [`${requestData.files.length} files included`]  // Don't log the full buffer
-    });
 
     console.log('Calling requestReimbursement...');
-    // Call our JS implementation
     const response = await requestReimbursement(requestData);
-    console.log('Received response from requestReimbursement:', response);
-
-    // The response is already in the correct format:
-    // {
-    //   status: 'Approved' or 'Rejected',
-    //   feedback: 'Analysis feedback text',
-    //   processed_files: number,
-    //   uploaded_files: ['s3_url1', 's3_url2', ...]
-    // }
     
     return response;
   } catch (error) {
@@ -478,52 +580,112 @@ async function forwardReimbursementRequest(data, receiptPath) {
   }
 }
 
-// New endpoint for admin policy upload
-app.post("/api/admin/upload_policy", isAuthenticated, upload.array('files'), async (req, res) => {
+app.post("/api/admin/set_policy", isAuthenticated, upload.single('policy'), async (req, res) => {
   try {
     const admin = await User.findById(req.session.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
 
-    const files = req.files;
-    const adminRepo = admin.email.replace('@', '').replace(/\./g, '');
-    
-    for (const file of files) {
-      const s3Key = `Reimbursement/${adminRepo}/policies/${file.originalname}`;
-      
-      await s3_client.upload({
-        Bucket: AWS_S3_BUCKET_NAME,
-        Key: s3Key,
-        Body: fs.createReadStream(file.path)
-      }).promise();
-
-      // Mark as active
-      await s3_client.upload({
-        Bucket: AWS_S3_BUCKET_NAME,
-        Key: `Reimbursement/${adminRepo}/policies/ACTIVE`,
-        Body: 'ACTIVE'
-      }).promise();
-
-      if (fs.existsSync(file.path)) {
-        fs.unlinkSync(file.path);
-      }
+    const { userEmail } = req.body;
+    if (!userEmail) {
+      return res.status(400).json({ message: 'User email is required' });
     }
 
-    res.json({ message: 'Policy uploaded successfully' });
+    // Find all groups owned by the admin
+    const adminGroups = await Group.find({ adminEmail: admin.email });
+
+    if (adminGroups.length === 0) {
+      return res.status(400).json({ message: 'You do not own any groups.' });
+    }
+
+    // Find the user
+    const user = await User.findOne({ email: userEmail });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Find the common group(s) between the admin and the user
+    const commonGroupIds = user.groups.filter(userGroupId =>
+      adminGroups.some(adminGroup => adminGroup._id.equals(userGroupId))
+    );
+
+    if (commonGroupIds.length === 0) {
+      return res.status(400).json({ message: 'User is not a member of any of your groups.' });
+    }
+
+    // Use the first common group (or adjust logic if multiple groups are possible)
+    const groupId = commonGroupIds[0];
+
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ message: 'Policy file is required' });
+    }
+
+    // Process the policy file and extract policy details
+    const processor = new MultiFileProcessor();
+    let policyText;
+    const ext = processor.constructor.getFileExtension(file.originalname);
+    const tempFilePath = await saveUploadFile(file);
+
+    if (ext === '.zip') {
+      const contents = await processor.constructor.processZip(tempFilePath);
+      policyText = contents.map(c => c.content).join('\n');
+    } else {
+      const processed = await processor.constructor.processSingleFile(tempFilePath);
+      policyText = processed.content;
+    }
+
+    // Extract policy details using OpenAI API
+    const { category, amount, times, days } = await extractPolicyDetails(policyText);
+
+    // Update the user's policies
+    const existingPolicyIndex = user.policies.findIndex(p => p.groupId.equals(groupId));
+
+    const newPolicy = {
+      groupId: groupId,
+      policy: {
+        category: category || 'Expenses',
+        amount: amount || 500,
+        frequency: {
+          times: times || 10,
+          days: days || 7
+        }
+      }
+    };
+
+    if (existingPolicyIndex >= 0) {
+      // Update existing policy
+      user.policies[existingPolicyIndex] = newPolicy;
+    } else {
+      // Add new policy
+      user.policies.push(newPolicy);
+    }
+
+    await user.save();
+
+    // Clean up temp file
+    if (fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+    }
+
+    res.json({ 
+      message: 'Policy updated successfully',
+      policy: newPolicy.policy 
+    });
+
   } catch (error) {
-    res.status(500).json({ message: 'Error uploading policy', error: error.message });
+    console.error('Error setting policy:', error);
+    res.status(500).json({ message: 'Error setting policy', error: error.message });
   }
 });
 
-// Modified request_reimbursement endpoint
 app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated, async (req, res) => {
   console.log("Received request body:", req.body);
   console.log("Received file:", req.file);
 
   const { reimbursement_details } = req.body;
   const receipt = req.file;
-
   try {
     const user = await User.findById(req.session.userId).populate('activeGroup');
     if (!user) {
@@ -533,6 +695,16 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       return res.status(401).json({ 
         status: "Error",
         feedback: "User not authenticated."
+      });
+    }
+  
+    if (!user.activeGroup) {
+      if (receipt && fs.existsSync(receipt.path)) {
+        fs.unlinkSync(receipt.path);
+      }
+      return res.status(400).json({ 
+        status: "Error",
+        feedback: "No active group found."
       });
     }
 
@@ -561,29 +733,35 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       });
     }
 
-    // Check request count
-    let requestCount = await RequestCount.findOne({
+    const userPolicy = user.policies.find(p => p.groupId.equals(user.activeGroup._id));
+    const policies = userPolicy ? userPolicy.policy : {
+      category: 'Expenses',
+      amount: 500,
+      frequency: { times: 10, days: 7 }
+    };
+
+    let tracking = await RequestTracking.findOne({
       userEmail: user.email,
-      adminEmail: admin_email
+      groupId: user.activeGroup._id
     });
 
-    if (!requestCount) {
-      requestCount = new RequestCount({
+    if (!tracking) {
+      tracking = new RequestTracking({
         userEmail: user.email,
-        adminEmail: admin_email
+        groupId: user.activeGroup._id
       });
     }
 
     const now = new Date();
-    const daysSinceReset = (now - requestCount.lastReset) / (1000 * 60 * 60 * 24);
-    
-    if (daysSinceReset >= 1) {
-      requestCount.count = 0;
-      requestCount.lastReset = now;
-    } else if (requestCount.count >= 10) {
+    const daysSinceReset = (now - tracking.lastReset) / (1000 * 60 * 60 * 24);
+
+    if (daysSinceReset >= policies.frequency.days) {
+      tracking.count = 0;
+      tracking.lastReset = now;
+    } else if (tracking.count >= policies.frequency.times) {
       return res.status(400).json({
         status: "Rejected",
-        feedback: "Daily request limit reached. Please try again tomorrow."
+        feedback: `Request limit reached. Maximum ${policies.frequency.times} requests every ${policies.frequency.days} days.`
       });
     }
 
@@ -594,14 +772,15 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
         name: user.name,
         email: user.email,
         admin_email,
-        reimbursement_details
+        reimbursement_details,
+        policies: policies
       },
       receipt.path
     );
 
     if (processedResponse.status === 'Approved') {
-      requestCount.count += 1;
-      await requestCount.save();
+      tracking.count += 1;
+      await tracking.save();
     }
 
     let parsedDetails = {};
@@ -617,8 +796,8 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       userEmail: user.email,
       adminEmail: admin_email,
       reimbursementDetails: reimbursement_details,
-      amount: parsedDetails.amount || 0,
-      category: parsedDetails.type || "unknown",
+      amount: processedResponse.amount,
+      category: processedResponse.category,
       receiptPath: receipt.path,
       s3Urls: processedResponse.uploaded_files || [],
       status: processedResponse.status,
@@ -626,7 +805,7 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
       groupId: user.activeGroup._id,
       createdAt: new Date()
     });
-
+    
     await reimbursementRequest.save();
     console.log("Reimbursement request saved to database");
 
@@ -751,13 +930,13 @@ app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
     }).sort({ createdAt: -1 });
 
     // Transform the data to match the frontend interface
-    const formattedReimbursements = reimbursements.map(r => ({
-      id: r._id,
-      amount: 0, // You might want to add this field to your schema
-      description: r.reimbursementDetails,
-      status: r.status.toLowerCase(),
-      date: r.createdAt,
-      category: "Expense" // You might want to add this field to your schema
+    const formattedReimbursements = reimbursements.map(reimbursement => ({
+      id: reimbursement._id,
+      amount: reimbursement.amount || 0,
+      description: reimbursement.reimbursementDetails,
+      status: reimbursement.status.toLowerCase(),
+      date: reimbursement.createdAt,
+      category: reimbursement.category || "Expense"
     }));
 
     res.json(formattedReimbursements);
@@ -767,42 +946,118 @@ app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
   }
 });
 
-// Add after other endpoints
-app.post("/api/admin/manual_policy", isAuthenticated, async (req, res) => {
+app.get("/api/user/policies", isAuthenticated, async (req, res) => {
+  try {
+    const user = await User.findById(req.session.userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const activeGroup = user.activeGroup;
+    if (!activeGroup) {
+      return res.status(400).json({ message: "No active group found" });
+    }
+
+    const userPolicy = user.policies.find(p => p.groupId.equals(activeGroup));
+    const policies = userPolicy ? userPolicy.policy : {
+      category: 'Expenses',
+      amount: 500,
+      frequency: { times: 10, days: 7 }
+    };
+
+    res.json(policies);
+  } catch (error) {
+    res.status(500).json({ message: "Error fetching policies", error });
+  }
+});
+
+// Get admin members endpoint
+app.get("/api/admin/members", isAuthenticated, async (req, res) => {
   try {
     const admin = await User.findById(req.session.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
 
-    const { category, amount, times, period } = req.body;
-    if (!category || !amount || !times || !period) {
-      return res.status(400).json({ message: 'All fields required' });
-    }
+    // Find groups owned by the admin
+    const groups = await Group.find({ adminEmail: admin.email });
 
-    if (!['day', 'week', 'month', 'year'].includes(period)) {
-      return res.status(400).json({ message: 'Invalid period' });
-    }
+    // Get users in these groups
+    const users = await User.find({ groups: { $in: groups.map(g => g._id) } });
 
-    const policyText = `Allow this user to spend in ${category} up to the amount of ${amount}. The user is allowed to make requests ${times} times per ${period}.`;
-    const adminRepo = admin.email.replace('@', '').replace(/\./g, '');
-    const s3Key = `Reimbursement/${adminRepo}/policies/manual_${category}.txt`;
+    // For each user, get their policies for the groups
+    const members = users.map(user => {
+      const userPolicies = user.policies
+        .filter(p => groups.some(g => g._id.equals(p.groupId)))
+        .map(p => ({
+          groupId: p.groupId,
+          policy: p.policy
+        }));
 
-    await s3_client.upload({
-      Bucket: AWS_S3_BUCKET_NAME,
-      Key: s3Key,
-      Body: policyText
-    }).promise();
+      return {
+        name: user.name,
+        email: user.email,
+        policies: userPolicies
+      };
+    });
 
-    await s3_client.upload({
-      Bucket: AWS_S3_BUCKET_NAME,
-      Key: `Reimbursement/${adminRepo}/policies/ACTIVE`,
-      Body: 'ACTIVE'
-    }).promise();
+    res.json({ members });
 
-    res.json({ message: 'Policy created successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Error creating policy', error: error.message });
+    res.status(500).json({ message: "Error fetching members", error });
+  }
+});
+
+// Get request limits status
+app.get("/api/user/request_limits", isAuthenticated, async (req, res) => {
+  try {
+    const user = await User.findById(req.session.userId).populate('activeGroup');
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (!user.activeGroup) {
+      return res.status(400).json({ message: "No active group found" });
+    }
+
+    let tracking = await RequestTracking.findOne({
+      userEmail: user.email,
+      groupId: user.activeGroup._id
+    });
+    
+    if (!tracking) {
+      tracking = new RequestTracking({
+        userEmail: user.email,
+        groupId: user.activeGroup._id
+      });
+    }
+
+    const userPolicy = user.policies.find(p => p.groupId.equals(user.activeGroup._id));
+    const policy = userPolicy ? userPolicy.policy : {
+      category: 'Expenses',
+      amount: 500,
+      frequency: { times: 10, days: 7 }
+    };
+
+    const daysSinceReset = Math.floor((Date.now() - tracking.lastReset) / (1000 * 60 * 60 * 24));
+    if (daysSinceReset >= policy.frequency.days) {
+      tracking.count = 0;
+      tracking.lastReset = new Date();
+      await tracking.save();
+    }
+
+    const remainingRequests = policy.frequency.times - tracking.count;
+    const nextResetDate = new Date(tracking.lastReset);
+    nextResetDate.setDate(nextResetDate.getDate() + policy.frequency.days);
+
+    res.json({
+      remainingRequests,
+      nextResetDate,
+      maxRequests: policy.frequency.times,
+      resetPeriodDays: policy.frequency.days
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Error fetching request limits", error });
   }
 });
 
