@@ -1,10 +1,10 @@
 {
 	"folders": [
 		{
-			"path": "../midas-frontend"
+			"path": "."
 		},
 		{
-			"path": "."
+			"path": "../front-end"
 		}
 	],
 	"settings": {

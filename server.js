@@ -28,6 +28,7 @@ const userSchema = new mongoose.Schema({
   company: String,
   email: { type: String, unique: true },
   password: String,
+  department: { type: String, default: 'General' },
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
   groups: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Group' }], // Array of group IDs
   activeGroup: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', default: null }, // Active group ID
@@ -152,7 +153,7 @@ function isAuthenticated(req, res, next) {
 
 // Register endpoint
 app.post("/api/register", async (req, res) => {
-  const { name, company, email, password, confirmPassword, isAdmin } = req.body;
+  const { name, company, email, password, confirmPassword, isAdmin, department } = req.body;
 
   // Validate required fields
   if (!name || !company || !email || !password || !confirmPassword) {
@@ -187,6 +188,7 @@ app.post("/api/register", async (req, res) => {
       company,
       email,
       password: hashedPassword,
+      department: department || 'General',
       role: role,
       groups: [],
       activeGroup: null,
@@ -335,7 +337,8 @@ app.get("/api/admin/users", isAuthenticated, async (req, res) => {
         company: user.company,
         groups: user.groups,
         activeGroup: user.activeGroup,
-        createdAt: user.createdAt
+        createdAt: user.createdAt,
+        department: user.department
       }))
     });
   } catch (error) {
