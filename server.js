@@ -8,9 +8,24 @@ const multer = require("multer"); // For handling file uploads
 const fs = require("fs");
 const path = require("path");
 const { requestReimbursement } = require('./reimbursement-processor');
+const AWS = require("aws-sdk");
+
 require("dotenv").config();
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key'; // Make sure to set this in .env
+
+const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
+const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
+const AWS_S3_BUCKET_NAME = process.env.AWS_S3_BUCKET_NAME || 'midasbucket';
+const AWS_REGION = process.env.AWS_REGION || 'us-east-2';
+
+const s3_client = new AWS.S3({
+  region: AWS_REGION,
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+});
+
+require("dotenv").config();
 
 const app = express();
 
@@ -77,6 +92,15 @@ const groupSchema = new mongoose.Schema({
 });
 
 const Group = mongoose.model('Group', groupSchema);
+
+// New schemas for policy management
+const requestCountSchema = new mongoose.Schema({
+  userEmail: String,
+  adminEmail: String,
+  count: { type: Number, default: 0 },
+  lastReset: { type: Date, default: Date.now }
+});
+const RequestCount = mongoose.model('RequestCount', requestCountSchema);
 
 // Middleware
 var secure = false;
@@ -707,6 +731,120 @@ app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
   } catch (error) {
     console.error("Error fetching reimbursements:", error);
     res.status(500).json({ message: "Error fetching reimbursements", error });
+  }
+});
+
+// Policy Management 
+// 
+//
+
+// New endpoint for admin policy upload
+app.post("/api/admin/upload_policy", isAuthenticated, upload.single('policyFile'), async (req, res) => {
+  try {
+    const admin = await User.findById(req.user.userId);
+    if (!admin || admin.role !== 'admin') {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ message: 'No file uploaded' });
+    }
+
+    const adminRepo = admin.email.replace('@', '').replace(/\./g, '');
+    const s3Key = `Reimbursement/${adminRepo}/policies/${file.originalname}`;
+    
+    await s3_client.upload({
+      Bucket: AWS_S3_BUCKET_NAME,
+      Key: s3Key,
+      Body: fs.createReadStream(file.path),
+      ContentType: file.mimetype
+    }).promise();
+
+    // Cleanup: Remove local file after upload
+    if (fs.existsSync(file.path)) {
+      fs.unlinkSync(file.path);
+    }
+
+    // Mark as active
+    await s3_client.upload({
+      Bucket: AWS_S3_BUCKET_NAME,
+      Key: `Reimbursement/${adminRepo}/policies/ACTIVE`,
+      Body: 'ACTIVE'
+    }).promise();
+
+    res.json({ 
+      message: 'Policy uploaded successfully',
+      files: [s3Key]
+    });
+  } catch (error) {
+    console.error('Error uploading policy:', error);
+    res.status(500).json({ message: 'Error uploading policy', error: error.message });
+  }
+});
+
+// Add after other endpoints
+app.post("/api/admin/manual_policy", isAuthenticated, async (req, res) => {
+  try {
+    console.log("Uploading policy to S3:")
+    const admin = await User.findById(req.session.userId);
+    if (!admin || admin.role !== 'admin') {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
+    const { category, amount, times, period } = req.body;
+    if (!category || !amount || !times || !period) {
+      return res.status(400).json({ message: 'All fields required' });
+    }
+
+    if (!['day', 'week', 'month', 'year'].includes(period)) {
+      return res.status(400).json({ message: 'Invalid period' });
+    }
+
+    const policyText = `Allow this user to spend in ${category} up to the amount of ${amount}. The user is allowed to make requests ${times} times per ${period}.`;
+    const adminRepo = admin.email.replace('@', '').replace(/\./g, '');
+    const s3Key = `Reimbursement/${adminRepo}/policies/manual_${category}.txt`;
+    await s3_client.upload({
+      Bucket: AWS_S3_BUCKET_NAME,
+      Key: s3Key,
+      Body: policyText
+    }).promise();
+
+    await s3_client.upload({
+      Bucket: AWS_S3_BUCKET_NAME,
+      Key: `Reimbursement/${adminRepo}/policies/ACTIVE`,
+      Body: 'ACTIVE'
+    }).promise();
+
+    res.json({ message: 'Policy created successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Error creating policy', error: error.message });
+  }
+});
+
+// New endpoint to list all policies for an admin
+app.get("/api/admin/policies", isAuthenticated, async (req, res) => {
+  try {
+    const admin = await User.findById(req.user.userId);
+    if (!admin || admin.role !== 'admin') {
+      return res.status(403).json({ message: 'Not authorized' });
+    }
+
+    const adminRepo = admin.email.replace('@', '').replace(/\./g, '');
+    const s3Prefix = `Reimbursement/${adminRepo}/policies/`;
+
+    const params = {
+      Bucket: AWS_S3_BUCKET_NAME,
+      Prefix: s3Prefix
+    };
+
+    const data = await s3_client.listObjectsV2(params).promise();
+    const policyFiles = data.Contents.map(item => path.basename(item.Key, path.extname(item.Key)));
+
+    res.json({ policies: policyFiles });
+  } catch (error) {
+    console.error('Error fetching policies:', error);
+    res.status(500).json({ message: 'Error fetching policies', error: error.message });
   }
 });
 

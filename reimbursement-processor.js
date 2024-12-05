@@ -9,7 +9,6 @@ const AdmZip = require('adm-zip');
 const dotenv = require('dotenv');
 const winston = require('winston');
 
-// Initialize Logging
 const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -21,24 +20,19 @@ const logger = winston.createLogger({
   ]
 });
 
-// Load Environment Variables
 dotenv.config();
 
-// OpenAI Configuration
 const configuration = new Configuration({
     apiKey: process.env.OPENAI_API_KEY
 });
 
-// AWS S3 Configuration
 const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const AWS_S3_BUCKET_NAME = process.env.AWS_S3_BUCKET_NAME || 'midasbucket';
 const AWS_REGION = process.env.AWS_REGION || 'us-east-2';
 
-// Initialize OpenAI client
 const client = new OpenAIApi(configuration);
 
-// Initialize S3 client using Main Account Credentials
 const s3_client = new AWS.S3({
     region: AWS_REGION,
     accessKeyId: AWS_ACCESS_KEY_ID,
@@ -46,7 +40,7 @@ const s3_client = new AWS.S3({
 });
 
 class MultiFileProcessor {
-    static ALLOWED_EXTENSIONS = new Set(['.docx', '.pdf', '.jpg', '.jpeg', '.png', '.zip']);
+    static ALLOWED_EXTENSIONS = new Set(['.docx', '.pdf', '.jpg', '.jpeg', '.png', '.zip', '.txt']);
     static IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png']);
     
     static getFileExtension(filename) {
@@ -75,7 +69,7 @@ class MultiFileProcessor {
             
             for (const line of lines) {
                 if (line.includes('\t') || line.includes('    ')) {
-                    const items = line.split('\t')
+                    let items = line.split('\t')
                         .map(item => item.trim())
                         .filter(item => item.trim());
                     
@@ -130,6 +124,48 @@ class MultiFileProcessor {
         } catch (e) {
             logger.error(`Error saving uploaded file: ${e.message}`);
             throw new Error(`Error saving uploaded file: ${e.message}`);
+        }
+    }
+
+    static async extractPolicies(adminEmail) {
+        try {
+            const adminRepo = adminEmail.replace('@', '').replace(/\./g, '');
+            const s3Prefix = `Reimbursement/${adminRepo}/policies/`;
+            
+            const objects = await s3_client.listObjects({
+                Bucket: AWS_S3_BUCKET_NAME,
+                Prefix: s3Prefix
+            }).promise();
+
+            if (!objects.Contents || objects.Contents.length === 0) {
+                return null;
+            }
+
+            let policiesText = '';
+            
+            for (const object of objects.Contents) {
+                if (object.Key.endsWith('ACTIVE')) continue;
+                
+                const file = await s3_client.getObject({
+                    Bucket: AWS_S3_BUCKET_NAME,
+                    Key: object.Key
+                }).promise();
+
+                const ext = path.extname(object.Key).toLowerCase();
+                
+                if (ext === '.txt') {
+                    policiesText += file.Body.toString('utf-8') + '\n';
+                } else if (ext === '.docx') {
+                    policiesText += await this.extractTextFromDocx(file.Body) + '\n';
+                } else if (ext === '.pdf') {
+                    policiesText += await this.extractTextFromPdf(file.Body) + '\n';
+                }
+            }
+            
+            return policiesText.trim() || null;
+        } catch (e) {
+            logger.error(`Error extracting policies: ${e.message}`);
+            return null;
         }
     }
 
@@ -189,6 +225,11 @@ class MultiFileProcessor {
                     content: await this.extractTextFromPdf(file_path),
                     is_image: false
                 };
+            } else if (ext === '.txt') {
+                return {
+                    content: fs.readFileSync(file_path, 'utf-8'),
+                    is_image: false
+                };
             } else if (this.IMAGE_EXTENSIONS.has(ext)) {
                 return {
                     content: this.encodeImage(file_path),
@@ -204,62 +245,86 @@ class MultiFileProcessor {
     }
 }
 
-async function analyzeWithGpt4o(content, is_image = false) {
-    try {
-        const messages = [
-            {
-                role: "system",
-                content: (
-                    "You are an assistant helping with reimbursement requests. " +
-                    "Analyze the receipt image and decide whether to 'Approve' or 'Reject' the request. " +
-                    "Do not consider the dates or any date-related information when processing your decision. " +
-                    "Focus solely on the content provided. " +
-                    "Please respond in the following format:\n\n" +
-                    "Decision: [Approve/Reject]\n" +
-                    "Feedback: [Your explanation here]\n\n" +
-                    "Please avoid using ambiguous language that might put the decision in doubt."
-                )
-            },
-            {
-                role: "user",
-                content: is_image 
-                    ? `Please analyze this receipt image in base64 format:\n\n${content}`
-                    : `Here is the document content:\n\n${content}`
+async function analyzeWithGpt4o(content, is_image = false, policies = '') {
+    const maxRetries = 3;
+    const baseDelay = 1000;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const baselinePolicy = `
+                Valid Expense Categories: Approve only expenses that fall under approved categories such as travel, meals, office supplies, or training programs. Decline others.
+                Receipt Requirement: Approve only if a valid receipt is provided with the claim.
+                Spending Limits:
+                    Meals: Up to $50 per day
+                    Travel (flight): Up to $500 per flight
+                    Office Supplies: Up to $200 per item
+                Submission Deadline: Expenses must be submitted within 30 days of the transaction date.
+                Policy Exceptions: If the claim exceeds limits or falls outside the categories, check for a valid manager's approval attached as additional documentation.
+            `;
+
+            const currentDate = new Date().toISOString();
+            const policyText = policies || baselinePolicy;
+
+            const messages = [
+                {
+                    role: "system",
+                    content: (
+                        "You are an assistant helping with reimbursement requests. " +
+                        "Analyze the receipt image and decide whether to 'Approve' or 'Reject' the request based on the following policies:\n\n" +
+                        policyText + "\n\n" +
+                        "Current date: " + currentDate + "\n\n" +
+                        "Please respond in the following format:\n\n" +
+                        "Decision: [Approve/Reject]\n" +
+                        "Feedback: [Your explanation here]\n\n" +
+                        "Please avoid using ambiguous language that might put the decision in doubt."
+                    )
+                },
+                {
+                    role: "user",
+                    content: is_image 
+                        ? `Please analyze this receipt image in base64 format:\n\n${content}`
+                        : `Here is the document content:\n\n${content}`
+                }
+            ];
+            
+            const response = await client.createChatCompletion({
+                model: "gpt-4o-mini",
+                messages: messages
+            });
+            
+            const analysis = response.data.choices[0].message.content;
+            const lines = analysis.trim().split('\n');
+            let decision = null;
+            const feedback_lines = [];
+
+            for (const line of lines) {
+                if (line.toLowerCase().startsWith("decision:")) {
+                    decision = line.substring("Decision:".length).trim();
+                } else if (line.toLowerCase().startsWith("feedback:")) {
+                    feedback_lines.push(line.substring("Feedback:".length).trim());
+                } else {
+                    feedback_lines.push(line.trim());
+                }
             }
-        ];
-        
-        const response = await client.createChatCompletion({
-            model: "gpt-4o-mini",
-            messages: messages
-        });
-        
-        const analysis = response.data.choices[0].message.content;
-        const lines = analysis.trim().split('\n');
-        let decision = null;
-        const feedback_lines = [];
 
-        for (const line of lines) {
-            if (line.toLowerCase().startsWith("decision:")) {
-                decision = line.substring("Decision:".length).trim();
-            } else if (line.toLowerCase().startsWith("feedback:")) {
-                feedback_lines.push(line.substring("Feedback:".length).trim());
-            } else {
-                feedback_lines.push(line.trim());
+            if (!['Approve', 'Reject'].includes(decision)) {
+                decision = 'Rejected';
             }
-        }
 
-        if (!['Approve', 'Reject'].includes(decision)) {
-            decision = 'Rejected';
+            return {
+                decision: decision,
+                feedback: feedback_lines.join('\n')
+            };
+        } catch (e) {
+            if (e.response?.status === 429 && attempt < maxRetries - 1) {
+                const delay = baseDelay * Math.pow(2, attempt);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+            throw e;
         }
-
-        return {
-            decision: decision,
-            feedback: feedback_lines.join('\n')
-        };
-    } catch (e) {
-        logger.error(`Error analyzing content: ${e.message}`);
-        throw new Error(`Error analyzing content: ${e.message}`);
     }
+    throw new Error('Max retries exceeded for OpenAI API');
 }
 
 function sanitizeFilename(filename) {
@@ -310,6 +375,9 @@ async function requestReimbursement(data) {
         const s3_urls = [];
         
         try {
+            // Get policies for this admin
+            const policies = await processor.constructor.extractPolicies(admin_email);
+            
             for (const file of files) {
                 const ext = processor.constructor.getFileExtension(file.originalname);
                 if (!processor.constructor.ALLOWED_EXTENSIONS.has(ext)) {
@@ -335,21 +403,20 @@ async function requestReimbursement(data) {
             for (const content_item of all_content) {
                 const analysis_result = await analyzeWithGpt4o(
                     content_item.content,
-                    content_item.is_image
+                    content_item.is_image,
+                    policies
                 );
-                decision = analysis_result.decision;
-                feedback = analysis_result.feedback;
+                const decision = analysis_result.decision;
+                const feedback = analysis_result.feedback;
 
                 combined_feedback += `${feedback}\n\n`;
                 decisions.push(decision);
             }
             
-            // Determine the overall decision
             const final_decision = decisions.every(dec => dec.toLowerCase() === 'approve')
                 ? 'Approved'
                 : 'Rejected';
             
-            // Upload files to S3
             for (const { path: temp_file, original_filename } of temp_files) {
                 const s3_url = await uploadToS3(temp_file, original_filename, final_decision, admin_email);
                 s3_urls.push(s3_url);
