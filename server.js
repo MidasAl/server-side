@@ -1,12 +1,12 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
-const session = require("express-session");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const jwt = require('jsonwebtoken');
 const { 
   MultiFileProcessor, 
   analyzeWithGpt4o,
@@ -18,6 +18,9 @@ const {
 } = require('./reimbursement-processor');
 const AWS = require("aws-sdk");
 
+require("dotenv").config();
+
+const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
 const AWS_ACCESS_KEY_ID = process.env.AWS_ACCESS_KEY_ID;
 const AWS_SECRET_ACCESS_KEY = process.env.AWS_SECRET_ACCESS_KEY;
 const AWS_S3_BUCKET_NAME = process.env.AWS_S3_BUCKET_NAME || 'midasbucket';
@@ -25,11 +28,9 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-2';
 
 const s3_client = new AWS.S3({
   region: AWS_REGION,
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  accessKeyId: AWS_ACCESS_KEY_ID,
+  secretAccessKey: AWS_SECRET_ACCESS_KEY
 });
-
-require("dotenv").config();
 
 const app = express();
 
@@ -50,7 +51,6 @@ const userSchema = new mongoose.Schema({
   role: { type: String, enum: ['user', 'admin'], default: 'user' },
   groups: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Group' }],
   activeGroup: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', default: null },
-  // Modifed policies to be per group
   policies: [{
     groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
     policy: {
@@ -67,6 +67,7 @@ const userSchema = new mongoose.Schema({
     email: String
   }]
 });
+const User = mongoose.model("User", userSchema);
 
 const requestTrackingSchema = new mongoose.Schema({
   userEmail: { type: String, required: true },
@@ -74,8 +75,6 @@ const requestTrackingSchema = new mongoose.Schema({
   count: { type: Number, default: 0 },
   lastReset: { type: Date, default: Date.now }
 });
-
-const User = mongoose.model("User", userSchema);
 const RequestTracking = mongoose.model('RequestTracking', requestTrackingSchema);
 
 // InviteCode schema and model
@@ -87,7 +86,6 @@ const inviteCodeSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   expiresAt: { type: Date, default: () => new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) },
 });
-
 const InviteCode = mongoose.model('InviteCode', inviteCodeSchema);
 
 // ReimbursementRequest schema and model
@@ -95,8 +93,8 @@ const reimbursementRequestSchema = new mongoose.Schema({
   userEmail: { type: String, required: true },
   adminEmail: { type: String, required: true },
   reimbursementDetails: { type: String, required: true },
-  amount: { type: Number, required: false },
-  category: { type: String, required: false },
+  amount: { type: Number },
+  category: { type: String },
   receiptPath: { type: String, required: true },
   s3Urls: [{ type: String }],
   status: { type: String, enum: ['Approved', 'Rejected', 'Pending'], required: true },
@@ -104,7 +102,6 @@ const reimbursementRequestSchema = new mongoose.Schema({
   groupId: { type: mongoose.Schema.Types.ObjectId, ref: 'Group', required: true },
   createdAt: { type: Date, default: Date.now }
 });
-
 const ReimbursementRequest = mongoose.model("ReimbursementRequest", reimbursementRequestSchema);
 
 // Group schema and model
@@ -117,24 +114,14 @@ const groupSchema = new mongoose.Schema({
   memberCount: { type: Number, default: 0 },
   lastActive: { type: Date, default: Date.now },
 });
-
 const Group = mongoose.model('Group', groupSchema);
 
 // Middleware
 app.use(cors({ origin: "http://localhost:3000", credentials: true }));
 app.use(express.json());
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || "your_secret_key",
-    resave: false,
-    saveUninitialized: false,
-    cookie: { secure: false },
-  })
-);
-
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Configure Multer
+// Multer config
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
     const uploadPath = path.join(__dirname, 'uploads');
@@ -168,12 +155,20 @@ const upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 }
 });
 
-// Authentication middleware
+// JWT-based isAuthenticated middleware
 function isAuthenticated(req, res, next) {
-  if (req.session.userId) {
+  try {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
     next();
-  } else {
-    res.status(401).json({ message: 'Not authenticated' });
+  } catch (error) {
+    console.error('Auth error:', error);
+    return res.status(401).json({ message: "Invalid or expired token" });
   }
 }
 
@@ -181,22 +176,18 @@ function isAuthenticated(req, res, next) {
 app.post("/api/register", async (req, res) => {
   const { name, company, email, password, confirmPassword, isAdmin } = req.body;
 
-  // Validate required fields
   if (!name || !company || !email || !password || !confirmPassword) {
     return res.status(400).json({ message: "All fields are required." });
   }
 
-  // Check if passwords match
   if (password !== confirmPassword) {
     return res.status(400).json({ message: "Passwords do not match." });
   }
 
-  // Check password length
   if (password.length < 10) {
     return res.status(400).json({ message: "Password must be at least 10 characters long." });
   }
 
-  // Check if user already exists
   const existingUser = await User.findOne({ email });
   if (existingUser) {
     return res.status(400).json({ message: "Email already exists." });
@@ -217,7 +208,7 @@ app.post("/api/register", async (req, res) => {
       role: role,
       groups: [],
       activeGroup: null,
-      policies: []  // Start with empty policies array
+      policies: []
     });
     await user.save();
     res.status(201).json({ message: "User registered successfully" });
@@ -226,7 +217,7 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
-// Login endpoint
+// Login endpoint (returns JWT token)
 app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
 
@@ -237,9 +228,18 @@ app.post("/api/login", async (req, res) => {
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) return res.status(400).json({ message: "Incorrect password" });
 
-    req.session.userId = user._id; // Store user ID in session
+    // Create JWT payload
+    const payload = {
+      userId: user._id,
+      email: user.email,
+      role: user.role,
+    };
+
+    // Generate JWT
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "1d" });
     res.json({
       message: "Login successful!",
+      token,
       user: {
         name: user.name,
         email: user.email,
@@ -251,10 +251,10 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-// Endpoint to get logged-in user profile
+// Get profile endpoint
 app.get("/api/profile", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId).populate('activeGroup');
+    const user = await User.findById(req.user.userId).populate('activeGroup');
     if (!user) return res.status(404).json({ message: "User not found" });
     
     let adminEmail = null;
@@ -267,7 +267,7 @@ app.get("/api/profile", isAuthenticated, async (req, res) => {
       email: user.email,
       company: user.company,
       role: user.role,
-      admin_email: adminEmail // Include admin_email from the active group
+      admin_email: adminEmail
     });
   } catch (error) {
     res.status(500).json({ message: "Error fetching profile", error });
@@ -276,47 +276,39 @@ app.get("/api/profile", isAuthenticated, async (req, res) => {
 
 // Logout endpoint
 app.post("/api/logout", (req, res) => {
-  req.session.destroy((err) => {
-    if (err) return res.status(500).json({ message: "Failed to log out" });
-    res.clearCookie("connect.sid"); // Clear session cookie
-    res.json({ message: "Logged out successfully" });
-  });
+  // With JWT, client discards token
+  res.json({ message: "Logged out successfully" });
 });
 
 // Generate invite code endpoint
 app.post("/api/admin/generate-code", isAuthenticated, async (req, res) => {
   try {
-    // First, verify the user is an admin
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
 
     if (!user || user.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
 
-    // Generate a random 8-character code
     const code = Math.random().toString(36).substring(2, 10).toUpperCase();
-    // Check if code already exists
     const existingCode = await InviteCode.findOne({ code });
     if (existingCode) {
       return res.status(400).json({ message: 'Please try again - code already exists' });
     }
 
-    // Create a new invite code
     const inviteCode = new InviteCode({
       code,
       createdBy: user._id,
       used: false,
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days from now
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
     });
     await inviteCode.save();
 
-    // Create a new group
     const group = new Group({
       name: user.company,
       company: user.company,
       inviteCode: code,
-      adminEmail: user.email, // Added adminEmail here
-      memberCount: 1, // Start with 1 for the admin
+      adminEmail: user.email,
+      memberCount: 1,
       lastActive: new Date()
     });
     await group.save();
@@ -347,26 +339,25 @@ app.post("/api/admin/generate-code", isAuthenticated, async (req, res) => {
 // Get users for admin
 app.get("/api/admin/users", isAuthenticated, async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
 
-    // Get all users who have joined groups created by this admin
     const adminGroups = await Group.find({ adminEmail: admin.email });
     const adminGroupIds = adminGroups.map(group => group._id);
 
     const users = await User.find({ groups: { $in: adminGroupIds } }).select('-password');
 
     res.json({ 
-      users: users.map(user => ({
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        company: user.company,
-        groups: user.groups,
-        activeGroup: user.activeGroup,
-        createdAt: user.createdAt
+      users: users.map(u => ({
+        id: u._id,
+        name: u.name,
+        email: u.email,
+        company: u.company,
+        groups: u.groups,
+        activeGroup: u.activeGroup,
+        createdAt: u.createdAt
       }))
     });
   } catch (error) {
@@ -388,7 +379,7 @@ app.post("/api/join_group", isAuthenticated, async (req, res) => {
       return res.status(400).json({ message: "Invalid or expired group code." });
     }
 
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
     if (!user) {
       return res.status(404).json({ message: "User not found." });
     }
@@ -402,14 +393,12 @@ app.post("/api/join_group", isAuthenticated, async (req, res) => {
       return res.status(400).json({ message: "User is already a member of this group." });
     }
 
-    // Add the group to user's groups array
     user.groups.push(group._id);
     if (!user.activeGroup) {
       user.activeGroup = group._id;
     }
     await user.save();
 
-    // Update admin's members array
     const admin = await User.findOne({ email: group.adminEmail });
     if (admin) {
       admin.members.push({
@@ -442,7 +431,7 @@ app.post("/api/switch_active_group", isAuthenticated, async (req, res) => {
   }
 
   try {
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
 
     if (!user) {
       return res.status(404).json({ message: "User not found." });
@@ -483,7 +472,6 @@ async function requestReimbursement(data) {
         }
         
         const temp_file_path = await saveUploadFile(file);
-
         const original_filename = sanitizeFilename(file.originalname);
         temp_files.push({ path: temp_file_path, original_filename });
         
@@ -582,7 +570,7 @@ async function forwardReimbursementRequest(data, receiptPath) {
 
 app.post("/api/admin/set_policy", isAuthenticated, upload.single('policy'), async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
@@ -592,20 +580,16 @@ app.post("/api/admin/set_policy", isAuthenticated, upload.single('policy'), asyn
       return res.status(400).json({ message: 'User email is required' });
     }
 
-    // Find all groups owned by the admin
     const adminGroups = await Group.find({ adminEmail: admin.email });
-
     if (adminGroups.length === 0) {
       return res.status(400).json({ message: 'You do not own any groups.' });
     }
 
-    // Find the user
     const user = await User.findOne({ email: userEmail });
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // Find the common group(s) between the admin and the user
     const commonGroupIds = user.groups.filter(userGroupId =>
       adminGroups.some(adminGroup => adminGroup._id.equals(userGroupId))
     );
@@ -614,7 +598,6 @@ app.post("/api/admin/set_policy", isAuthenticated, upload.single('policy'), asyn
       return res.status(400).json({ message: 'User is not a member of any of your groups.' });
     }
 
-    // Use the first common group (or adjust logic if multiple groups are possible)
     const groupId = commonGroupIds[0];
 
     const file = req.file;
@@ -622,7 +605,6 @@ app.post("/api/admin/set_policy", isAuthenticated, upload.single('policy'), asyn
       return res.status(400).json({ message: 'Policy file is required' });
     }
 
-    // Process the policy file and extract policy details
     const processor = new MultiFileProcessor();
     let policyText;
     const ext = processor.constructor.getFileExtension(file.originalname);
@@ -636,10 +618,8 @@ app.post("/api/admin/set_policy", isAuthenticated, upload.single('policy'), asyn
       policyText = processed.content;
     }
 
-    // Extract policy details using OpenAI API
     const { category, amount, times, days } = await extractPolicyDetails(policyText);
 
-    // Update the user's policies
     const existingPolicyIndex = user.policies.findIndex(p => p.groupId.equals(groupId));
 
     const newPolicy = {
@@ -655,16 +635,13 @@ app.post("/api/admin/set_policy", isAuthenticated, upload.single('policy'), asyn
     };
 
     if (existingPolicyIndex >= 0) {
-      // Update existing policy
       user.policies[existingPolicyIndex] = newPolicy;
     } else {
-      // Add new policy
       user.policies.push(newPolicy);
     }
 
     await user.save();
 
-    // Clean up temp file
     if (fs.existsSync(tempFilePath)) {
       fs.unlinkSync(tempFilePath);
     }
@@ -687,7 +664,7 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
   const { reimbursement_details } = req.body;
   const receipt = req.file;
   try {
-    const user = await User.findById(req.session.userId).populate('activeGroup');
+    const user = await User.findById(req.user.userId).populate('activeGroup');
     if (!user) {
       if (receipt && fs.existsSync(receipt.path)) {
         fs.unlinkSync(receipt.path);
@@ -837,18 +814,15 @@ app.post("/api/request_reimbursement", upload.single('receipt'), isAuthenticated
   }
 });
 
-
 // Admin Dashboard to View Reimbursement Requests
 app.get("/api/admin/reimbursements", isAuthenticated, async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
 
-    // Find all reimbursement requests associated with this admin
     const reimbursements = await ReimbursementRequest.find({ adminEmail: admin.email }).sort({ createdAt: -1 });
-
     res.status(200).json({ reimbursements });
   } catch (error) {
     console.error("Error fetching reimbursements:", error);
@@ -859,10 +833,8 @@ app.get("/api/admin/reimbursements", isAuthenticated, async (req, res) => {
 // Error-handling middleware for Multer
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
-    // A Multer error occurred when uploading.
     return res.status(400).json({ error: err.message });
   } else if (err) {
-    // An unknown error occurred.
     return res.status(500).json({ error: err.message });
   }
   next();
@@ -871,7 +843,7 @@ app.use((err, req, res, next) => {
 // Admin Info Endpoint
 app.get("/api/admin/info", isAuthenticated, async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
@@ -887,12 +859,11 @@ app.get("/api/admin/info", isAuthenticated, async (req, res) => {
 // Get user's groups endpoint
 app.get("/api/groups", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId).populate('groups').populate('activeGroup');
+    const user = await User.findById(req.user.userId).populate('groups').populate('activeGroup');
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Get all groups the user belongs to
     const groups = user.groups;
 
     const groupsData = await Promise.all(groups.map(async (group) => {
@@ -920,7 +891,7 @@ app.get("/api/groups", isAuthenticated, async (req, res) => {
 // Get user's reimbursement requests endpoint
 app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -929,7 +900,6 @@ app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
       userEmail: user.email 
     }).sort({ createdAt: -1 });
 
-    // Transform the data to match the frontend interface
     const formattedReimbursements = reimbursements.map(reimbursement => ({
       id: reimbursement._id,
       amount: reimbursement.amount || 0,
@@ -948,7 +918,7 @@ app.get("/api/users_reimbursements", isAuthenticated, async (req, res) => {
 
 app.get("/api/user/policies", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId);
+    const user = await User.findById(req.user.userId);
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -974,20 +944,16 @@ app.get("/api/user/policies", isAuthenticated, async (req, res) => {
 // Get admin members endpoint
 app.get("/api/admin/members", isAuthenticated, async (req, res) => {
   try {
-    const admin = await User.findById(req.session.userId);
+    const admin = await User.findById(req.user.userId);
     if (!admin || admin.role !== 'admin') {
       return res.status(403).json({ message: 'Not authorized' });
     }
 
-    // Find groups owned by the admin
     const groups = await Group.find({ adminEmail: admin.email });
-
-    // Get users in these groups
     const users = await User.find({ groups: { $in: groups.map(g => g._id) } });
 
-    // For each user, get their policies for the groups
-    const members = users.map(user => {
-      const userPolicies = user.policies
+    const members = users.map(u => {
+      const userPolicies = u.policies
         .filter(p => groups.some(g => g._id.equals(p.groupId)))
         .map(p => ({
           groupId: p.groupId,
@@ -995,8 +961,8 @@ app.get("/api/admin/members", isAuthenticated, async (req, res) => {
         }));
 
       return {
-        name: user.name,
-        email: user.email,
+        name: u.name,
+        email: u.email,
         policies: userPolicies
       };
     });
@@ -1011,7 +977,7 @@ app.get("/api/admin/members", isAuthenticated, async (req, res) => {
 // Get request limits status
 app.get("/api/user/request_limits", isAuthenticated, async (req, res) => {
   try {
-    const user = await User.findById(req.session.userId).populate('activeGroup');
+    const user = await User.findById(req.user.userId).populate('activeGroup');
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
